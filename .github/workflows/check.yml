@@ -1,0 +1,208 @@
+name: Проверка паков
+
+# Зачем два триггера с одинаковым фильтром путей.
+#
+# pull_request и push (в main) — разные по доверию события: у push исполнитель
+# уже имел право писать в main, у pull_request из форка — нет. GitHub сам
+# выдаёт GITHUB_TOKEN только на чтение (contents: read), когда pull_request
+# пришёл из форка, — независимо от того, что написано в permissions: ниже.
+# Мы намеренно НЕ переходим на pull_request_target, чтобы это «исправить»:
+# это была бы ровно та замена, что превращает проверку чужого PR в исполнение
+# чужого кода с токеном базового репозитория. Здесь везде обычный
+# pull_request, и job ничего не пишет — только читает и вызывает публичный
+# анонимный /registry/validate.
+#
+# paths ограничивает оба триггера: если правка не трогает packs/** или
+# tools/**, разбираться не в чём — незачем и запускаться.
+on:
+  pull_request:
+    paths:
+      - "packs/**"
+      - "tools/**"
+  push:
+    branches: [main]
+    paths:
+      - "packs/**"
+      - "tools/**"
+
+# Без секретов: ни один шаг ниже не читает secrets.*. validate — анонимный
+# живой вызов площадки, check/build работают на локальном дереве.
+permissions:
+  contents: read
+
+jobs:
+  # Отдельный job вместо шага: strategy.matrix нельзя собрать динамически
+  # внутри одного job — список изменённых паков должен появиться ДО того,
+  # как GitHub Actions вычисляет матрицу следующего job.
+  discover:
+    name: Найти изменённые паки
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      packs: ${{ steps.diff.outputs.packs }}
+      has_packs: ${{ steps.diff.outputs.has_packs }}
+    steps:
+      - name: Получить дерево (с историей — нужна для git diff)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.7"
+
+      - name: Определить изменённые паки
+        id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA_PR: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA_PR: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA_PUSH: ${{ github.event.before }}
+          HEAD_SHA_PUSH: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          # Дерево без единого коммита (для diff «относительно пустоты») —
+          # используется, когда «before» не резолвится (например, push,
+          # создавший ветку с нуля).
+          EMPTY_TREE="4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$BASE_SHA_PR"
+            HEAD="$HEAD_SHA_PR"
+          else
+            BASE="$BASE_SHA_PUSH"
+            HEAD="$HEAD_SHA_PUSH"
+          fi
+
+          if [ -z "$BASE" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE="$EMPTY_TREE"
+          fi
+          if [ -z "$HEAD" ]; then
+            HEAD="HEAD"
+          fi
+
+          echo "diff base=$BASE head=$HEAD"
+          CHANGED_FILES="$(git diff --name-only "$BASE" "$HEAD" || true)"
+          echo "изменённые файлы:"
+          printf '%s\n' "$CHANGED_FILES"
+
+          TOOLS_CHANGED=0
+          if printf '%s\n' "$CHANGED_FILES" | grep -q '^tools/'; then
+            TOOLS_CHANGED=1
+          fi
+
+          # Пути изменённых паков: packs/<namespace>/<name>/..., без хвоста.
+          CHANGED_PACKS="$(printf '%s\n' "$CHANGED_FILES" \
+            | grep -E '^packs/[^/]+/[^/]+/' \
+            | cut -d/ -f1-3 \
+            | sort -u || true)"
+
+          if [ "$TOOLS_CHANGED" = "1" ]; then
+            # Инструмент поменялся — проверяем ВСЕ существующие паки, а не
+            # только изменённые: регрессия в pack.py иначе всплывёт не в
+            # этом прогоне, а у первого автора, который тронет свой пак.
+            echo "tools/** изменился — берём все существующие паки"
+            PACK_DIRS="$(find packs -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort -u || true)"
+          else
+            PACK_DIRS="$CHANGED_PACKS"
+          fi
+
+          echo "паки к проверке:"
+          printf '%s\n' "$PACK_DIRS"
+
+          PACKS_JSON="$(python3 - "$PACK_DIRS" <<'PY'
+          import json
+          import sys
+          dirs = [d for d in sys.argv[1].splitlines() if d.strip()]
+          print(json.dumps(sorted(set(dirs))))
+          PY
+          )"
+
+          echo "packs=$PACKS_JSON" >> "$GITHUB_OUTPUT"
+          if [ "$PACKS_JSON" = "[]" ]; then
+            echo "has_packs=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_packs=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  check:
+    name: "Пак: ${{ matrix.pack }}"
+    needs: discover
+    if: needs.discover.outputs.has_packs == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pack: ${{ fromJson(needs.discover.outputs.packs) }}
+    steps:
+      - name: Получить дерево
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.7"
+
+      - name: pack.py check — локальные проверки дерева пака
+        env:
+          PACK_DIR: ${{ matrix.pack }}
+        run: |
+          set -euo pipefail
+          python3 tools/pack.py check "$PACK_DIR"
+
+      - name: pack.py build — первая сборка
+        id: build1
+        env:
+          PACK_DIR: ${{ matrix.pack }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist1
+          python3 tools/pack.py build "$PACK_DIR" --out dist1 | tee build1.json
+          SHA256="$(python3 -c 'import json;print(json.load(open("build1.json"))["sha256"])')"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: pack.py build — вторая сборка (сверка воспроизводимости)
+        id: build2
+        env:
+          PACK_DIR: ${{ matrix.pack }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist2
+          python3 tools/pack.py build "$PACK_DIR" --out dist2 | tee build2.json
+          SHA256="$(python3 -c 'import json;print(json.load(open("build2.json"))["sha256"])')"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Сверить sha256 двух сборок
+        env:
+          SHA1: ${{ steps.build1.outputs.sha256 }}
+          SHA2: ${{ steps.build2.outputs.sha256 }}
+          PACK_DIR: ${{ matrix.pack }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Сборка ${PACK_DIR}"
+            echo "- sha256 (сборка 1): \`${SHA1}\`"
+            echo "- sha256 (сборка 2): \`${SHA2}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$SHA1" != "$SHA2" ]; then
+            echo "РАСХОЖДЕНИЕ: две сборки одного дерева дали разный sha256" >&2
+            echo "- **РАСХОЖДЕНИЕ — сборка не детерминирована**" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "- сборка воспроизводима" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: pack.py validate — живая проверка манифеста без входа
+        env:
+          PACK_DIR: ${{ matrix.pack }}
+        run: |
+          set -euo pipefail
+          python3 tools/pack.py validate "$PACK_DIR"

