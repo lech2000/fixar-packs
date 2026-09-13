@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """pack.py — инструмент автора пака для площадки ФиксАР.
 
-Стандартная библиотека Python 3.10+, без обязательных зависимостей.
-Единственная необязательная зависимость — PyYAML: без неё команда ``check``
-пропускает разбор ``pack.yaml`` (и, значит, сверку namespace/name/version с
-путём) с явным сообщением об этом, но остальные локальные проверки всё
-равно выполняются. Команды ``build``, ``tag`` и ``validate`` читают из
-``pack.yaml`` намерение автора (namespace/name/version, а иногда — состав
-направлений), и без PyYAML честно отказываются работать, а не гадают по
-регулярным выражениям.
+Python 3.10+ и PyYAML (``pip install pyyaml``). Все команды читают из
+``pack.yaml`` намерение автора (namespace/name/version, состав направлений),
+и без PyYAML отказываются работать, а не гадают по регулярным выражениям и
+не пропускают проверку молча: пропущенная сверка выглядела бы пройденной.
 
 Команды:
   check <каталог-пака>                локальные проверки, без сети
@@ -44,7 +40,7 @@ from typing import Any
 try:
     import yaml  # type: ignore[import-untyped]
     _HAS_YAML = True
-except ImportError:  # PyYAML необязателен — см. модульный docstring выше.
+except ImportError:  # без PyYAML команды отказывают — см. docstring выше.
     yaml = None  # type: ignore[assignment]
     _HAS_YAML = False
 
@@ -175,11 +171,10 @@ def разобрать_каталог(pack_dir: Path) -> РезультатРа�
 
     if r.manifest_text is not None:
         if not _HAS_YAML:
-            print(
-                "PyYAML не найден — проверка соответствия "
-                "namespace/name/version пути ПРОПУЩЕНА "
-                "(pip install pyyaml, чтобы включить)",
-                file=sys.stderr)
+            r.находки.append(
+                "PyYAML не установлен: без него pack.yaml не разобрать и "
+                "namespace/name/version с путём не сверить. Установите: "
+                "pip install pyyaml")
         else:
             try:
                 сырой = yaml.safe_load(r.manifest_text)
